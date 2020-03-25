@@ -157,7 +157,8 @@ def check_and_prune_fields(df):
         # drop threads...pool#default/worker-thread...count/cumulative-phases
         df = df.loc[df.countername != 'count/cumulative-phases']
         df = df.loc[df.countername != 'count/cumulative']
-    drop_irrelevant_counters(df)
+        return df
+    df = drop_irrelevant_counters(df)
 
     # units can only be [0.01%], 1, [s], and [ns]
     def check_all_data_units(df):
@@ -179,6 +180,7 @@ def check_and_prune_fields(df):
         del df['timestamp']
         del df['general_form']
     remove_unused_columns(df)
+    return df
 
 
 def process_df(df):
@@ -250,7 +252,7 @@ def main():
             df = extract_counters_df(hpx_out)
 
         with step_block('pruning fields'):
-            check_and_prune_fields(df)
+            df = check_and_prune_fields(df)
 
         with step_block('extracing values'):
             df = process_df(df)

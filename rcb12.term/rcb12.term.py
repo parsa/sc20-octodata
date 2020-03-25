@@ -221,6 +221,9 @@ class step_block(object):
         print(self.msg)
 
     def __exit__(self, type, value, tb):
+        assert type is None
+        assert value is None
+        assert tb is None
         print('done', self.msg)
 
 

@@ -5,6 +5,8 @@ import glob
 import re
 import pandas as pd
 
+from prompt_toolkit.shortcuts import ProgressBar
+
 
 def get_pfx_counter_line_pattern():
     return re.compile(
@@ -89,54 +91,51 @@ def read_file(filepath):
     return hpx_output
 
 
-def extract_counters_df(hpx_output):
+def extract_counter_lines(hpx_output, pfx_counter_line_pattern):
     assert isinstance(hpx_output, str)
 
-    all_counters = []
     for pfx_counter_line in pfx_counter_line_pattern.finditer(hpx_output):
         raw_line = pfx_counter_line.group(0)
-        line_split = raw_line.split(',')
 
-        def justify_fields(line_split):
-            if len(line_split) == 5:
+        line_segments = raw_line.split(',')
+
+        def justify_fields(segments):
+            if len(segments) == 5:
                 # unit for count values
-                line_split += ('1')
-            assert len(line_split) == 6
-        justify_fields(line_split)
+                segments += ('1')
+            assert len(segments) == 6
+        justify_fields(line_segments)
 
-        raw_general_name = line_split[0]
-        split_general_form = general_counter_form_pattern.match(
-            raw_general_name)
-        assert split_general_form is not None
+        yield line_segments
 
-        countername_groups = split_general_form.groupdict()
 
-        def unify_instance_field(countername_groups):
-            if countername_groups['instance1'] is not None:
-                countername_groups['instance'] = countername_groups['instance1']
+def process_counters(lines, general_counter_form_pattern):
+    for segments in lines:
+        general_form = segments[0]
+        general_form_m = general_counter_form_pattern.match(
+            general_form)
+        assert general_form_m is not None
+
+        value_group_dict = general_form_m.groupdict()
+
+        def unify_instance_field(groups):
+            if groups['instance1'] is not None:
+                groups['instance'] = groups['instance1']
             else:
-                countername_groups['instance'] = countername_groups['instance2']
+                groups['instance'] = groups['instance2']
 
-            del countername_groups['instance1']
-            del countername_groups['instance2']
-        unify_instance_field(countername_groups)
+            del groups['instance1']
+            del groups['instance2']
+        unify_instance_field(value_group_dict)
 
-        all_counters += [(
-            countername_groups["object"],
-            countername_groups["locality"],
-            countername_groups["instance"],
-            countername_groups["counter"],
-            countername_groups["thread_id"],
-            countername_groups["params"],
-        ) + tuple(line_split)]
-
-    df = pd.DataFrame(all_counters, columns=[
-        'objectname', 'locality', 'instance', 'countername', 'thread_id',
-        'parameters', 'general_form', 'iteration', 'timestamp',
-        'timestamp_unit', 'value', 'unit'])
-    assert isinstance(df, pd.DataFrame)
-    assert len(df) != 0
-    return df
+        yield (
+            value_group_dict["object"],
+            value_group_dict["locality"],
+            value_group_dict["instance"],
+            value_group_dict["counter"],
+            value_group_dict["thread_id"],
+            value_group_dict["params"],
+        ) + tuple(segments)
 
 
 def check_and_prune_fields(df):
@@ -153,12 +152,11 @@ def check_and_prune_fields(df):
 
     def drop_irrelevant_counters(df):
         # drop AGAS results
-        df = df.loc[df.objectname != 'agas']
+        df.drop(df.index[df.objectname == 'agas'], inplace=True)
         # drop threads...pool#default/worker-thread...count/cumulative-phases
-        df = df.loc[df.countername != 'count/cumulative-phases']
-        df = df.loc[df.countername != 'count/cumulative']
-        return df
-    df = drop_irrelevant_counters(df)
+        df.drop(df.index[df.countername == 'count/cumulative-phases'], inplace=True)
+        df.drop(df.index[df.countername == 'count/cumulative'], inplace=True)
+    drop_irrelevant_counters(df)
 
     # units can only be [0.01%], 1, [s], and [ns]
     def check_all_data_units(df):
@@ -167,7 +165,6 @@ def check_and_prune_fields(df):
         x = x.loc[x.unit != '[s]']
         x = x.loc[x.unit != '[ns]']
         assert len(x) == 0
-
     check_all_data_units(df)
 
     def remove_unused_columns(df):
@@ -180,7 +177,6 @@ def check_and_prune_fields(df):
         del df['timestamp']
         del df['general_form']
     remove_unused_columns(df)
-    return df
 
 
 def process_df(df):
@@ -210,59 +206,86 @@ def process_df(df):
     return result
 
 
-# Counter line search and counter name parsing regex patterns
-pfx_counter_line_pattern = get_pfx_counter_line_pattern()
-general_counter_form_pattern = get_general_counter_form_pattern()
-
-
 class step_block(object):
-    def __init__(self, msg):
+    def __init__(self, msg, bar, ev_count=1):
+        assert ev_count > 0
+        self.bar = bar
         self.msg = msg
+        self.ev_count = ev_count - 1
 
     def __enter__(self):
-        print(self.msg)
+        self.it = iter(
+            self.bar(
+                range(self.ev_count),
+                label=self.msg,
+                remove_when_done=True))
+        return self
+
+    def report(self):
+        try:
+            next(self.it)
+        except StopIteration:
+            pass
 
     def __exit__(self, type, value, tb):
         assert type is None
         assert value is None
         assert tb is None
-        print('done', self.msg)
+        self.report()
 
 
 def main():
-    with step_block('checking regex patterns integrity'):
-        test_general_counter_form_pattern(general_counter_form_pattern)
-        test_pfx_counter_line_pattern(pfx_counter_line_pattern)
+    with ProgressBar(title='Processing HPX output files') as bar:
+        # Counter line search and counter name parsing regex patterns
+        counter_line_pattern = get_pfx_counter_line_pattern()
+        counter_form_pattern = get_general_counter_form_pattern()
 
-    with step_block('listing *.txt files in current directory'):
-        hpx_output_files = glob.glob('*.txt')
-        assert isinstance(hpx_output_files, list)
-        assert len(hpx_output_files) >= 1
+        with step_block('Checking regex patterns integrity', bar, 2) as sb:
+            test_general_counter_form_pattern(counter_form_pattern)
+            sb.report()
+            test_pfx_counter_line_pattern(counter_line_pattern)
 
-    for rf in hpx_output_files:
-        print(80 * '=')
-        print('subject:', rf)
-        print(80 * '-')
+        with step_block('Listing *.txt files in current directory', bar, 2) as sb:
+            hpx_output_files = glob.glob('*.txt')
+            sb.report()
+            assert isinstance(hpx_output_files, list)
+            assert len(hpx_output_files) >= 1
 
-        r0f = os.path.join(os.curdir, rf)
-        with step_block('reading ' + r0f):
-            hpx_out = read_file(r0f)
+        for rf in bar(hpx_output_files, label='Processed file(s)'):
+            # print(80 * '=')
+            # print('subject:', rf)
+            # print(80 * '-')
 
-        with step_block('extracing performance counter lines'):
-            df = extract_counters_df(hpx_out)
+            r0f = os.path.join(os.curdir, rf)
+            with step_block(r0f + ': Reading', bar):
+                hpx_out = read_file(r0f)
 
-        with step_block('pruning fields'):
-            df = check_and_prune_fields(df)
+            with step_block(r0f + ': Extracting counters', bar):
+                line_gen = extract_counter_lines(hpx_out, counter_line_pattern)
 
-        with step_block('extracing values'):
-            df = process_df(df)
+            with step_block(r0f + ': Processing counters', bar, 2) as sb:
+                col_gen = process_counters(line_gen, counter_form_pattern)
+                sb.report()
+                vals = list(col_gen)
 
-        def get_csv_output_path(original_path):
-            return os.path.splitext(original_path)[0] + '.csv'
-        of = get_csv_output_path(rf)
+            with step_block(r0f + ': Assembling dataframe', bar):
+                df = pd.DataFrame(vals, columns=[
+                    'objectname', 'locality', 'instance', 'countername',
+                    'thread_id', 'parameters', 'general_form', 'iteration',
+                    'timestamp', 'timestamp_unit', 'value', 'unit'])
 
-        with step_block('writing to ' + of):
-            df.to_csv(of)
+            with step_block(r0f + ': Pruning fields', bar):
+                check_and_prune_fields(df)
+
+            with step_block(r0f + ': Extracing values', bar):
+                vdf = process_df(df)
+
+            def get_csv_output_path(original_path):
+                return os.path.splitext(original_path)[0] + '.csv'
+            of = get_csv_output_path(rf)
+
+            with step_block('Writing to ' + of, bar):
+                vdf.to_csv(of, float_format='%g')
 
 
 if __name__ == '__main__':

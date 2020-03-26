@@ -4,8 +4,10 @@ import os
 import glob
 import re
 import pandas as pd
+import concurrent.futures
 
 from prompt_toolkit.shortcuts import ProgressBar
+from prompt_toolkit.shortcuts.progress_bar.base import ProgressBarCounter
 
 
 def get_pfx_counter_line_pattern():
@@ -139,8 +141,6 @@ def process_counters(lines, general_counter_form_pattern):
 
 
 def check_and_prune_fields(df):
-    assert isinstance(df, pd.DataFrame)
-
     def fix_units(df):
         df.locality = pd.to_numeric(df.locality, downcast='unsigned')
         df.iteration = pd.to_numeric(df.iteration, downcast='unsigned')
@@ -148,15 +148,15 @@ def check_and_prune_fields(df):
         df.value = pd.to_numeric(df.value)
         df.thread_id = pd.to_numeric(df.thread_id, downcast='unsigned')
         df.loc[df.countername == 'idle-rate', 'value'] *= 0.01
-    fix_units(df)
 
     def drop_irrelevant_counters(df):
+        def drop_values(column, value):
+            df.drop(df.index[df[column] == value], inplace=True)
         # drop AGAS results
-        df.drop(df.index[df.objectname == 'agas'], inplace=True)
+        drop_values('objectname', 'agas')
         # drop threads...pool#default/worker-thread...count/cumulative-phases
-        df.drop(df.index[df.countername == 'count/cumulative-phases'], inplace=True)
-        df.drop(df.index[df.countername == 'count/cumulative'], inplace=True)
-    drop_irrelevant_counters(df)
+        drop_values('countername', 'count/cumulative-phases')
+        drop_values('countername', 'count/cumulative')
 
     # units can only be [0.01%], 1, [s], and [ns]
     def check_all_data_units(df):
@@ -165,7 +165,6 @@ def check_and_prune_fields(df):
         x = x.loc[x.unit != '[s]']
         x = x.loc[x.unit != '[ns]']
         assert len(x) == 0
-    check_all_data_units(df)
 
     def remove_unused_columns(df):
         # no parameters are expected
@@ -176,6 +175,12 @@ def check_and_prune_fields(df):
         del df['unit']
         del df['timestamp']
         del df['general_form']
+
+    assert isinstance(df, pd.DataFrame)
+
+    fix_units(df)
+    drop_irrelevant_counters(df)
+    check_all_data_units(df)
     remove_unused_columns(df)
 
 
@@ -206,86 +211,125 @@ def process_df(df):
     return result
 
 
-class step_block(object):
-    def __init__(self, msg, bar, ev_count=1):
-        assert ev_count > 0
-        self.bar = bar
-        self.msg = msg
-        self.ev_count = ev_count - 1
+def process_file(rf, counter_line_pattern, counter_form_pattern, pc):
+    r0f = os.path.join(os.curdir, rf)
+    pc.report(0, 7, 'Reading')
+    hpx_out = read_file(r0f)
 
-    def __enter__(self):
-        self.it = iter(
-            self.bar(
-                range(self.ev_count),
-                label=self.msg,
-                remove_when_done=True))
-        return self
+    pc.advance(label='Extracting counters')
+    line_gen = extract_counter_lines(hpx_out, counter_line_pattern)
 
-    def report(self):
-        try:
-            next(self.it)
-        except StopIteration:
-            pass
+    pc.advance(label='Processing counters')
+    col_gen = process_counters(line_gen, counter_form_pattern)
+    vals = list(col_gen)
 
-    def __exit__(self, type, value, tb):
-        assert type is None
-        assert value is None
-        assert tb is None
-        self.report()
+    pc.advance(label='Assembling dataframe')
+    df = pd.DataFrame(vals, columns=[
+        'objectname', 'locality', 'instance', 'countername',
+        'thread_id', 'parameters', 'general_form', 'iteration',
+        'timestamp', 'timestamp_unit', 'value', 'unit'])
+
+    pc.advance(label='Pruning fields')
+    check_and_prune_fields(df)
+
+    pc.advance(label='Extracting values')
+    vdf = process_df(df)
+
+    def get_csv_output_path(original_path):
+        return os.path.splitext(original_path)[0] + '.csv'
+    of = get_csv_output_path(rf)
+
+    pc.advance(label='Exporting to ' + of)
+    vdf.to_csv(of, float_format='%g')
+    pc.advance(label='Exported ' + of)
+    pc.finish()
+
+
+def run(mgr):
+    pc = mgr.add('Counter line search and counter name parsing regex patterns', 2)
+    pc.report(0, 2)
+    counter_line_pattern = get_pfx_counter_line_pattern()
+    pc.report(1, 2)
+    counter_form_pattern = get_general_counter_form_pattern()
+    pc.finish()
+
+    def check_regex_patterns_integrity():
+        test_general_counter_form_pattern(counter_form_pattern)
+        test_pfx_counter_line_pattern(counter_line_pattern)
+    pc = mgr.add('Checking regex patterns integrity')
+    check_regex_patterns_integrity()
+    pc.finish()
+
+    def list_txt_files_in_cur_dir():
+        hpx_output_files = glob.glob('*.txt')
+        assert isinstance(hpx_output_files, list)
+        assert len(hpx_output_files) >= 1
+        return hpx_output_files
+    pc = mgr.add('Listing *.txt files in current directory')
+    hpx_output_files = list_txt_files_in_cur_dir()
+    pc.finish()
+
+    def task_process_file(rf, mgr):
+        pc = mgr.add(rf, remove_when_done=False)
+        process_file(rf, counter_line_pattern, counter_form_pattern, pc)
+        pc.finish()
+
+    with concurrent.futures.ThreadPoolExecutor(4) as executor:
+        conversion_tasks = {executor.submit(task_process_file, rf, mgr): rf for rf in hpx_output_files}
+        for future in concurrent.futures.as_completed(conversion_tasks):
+            rf = conversion_tasks[future]
+            try:
+                future.result()
+            except Exception as ex:
+                print(rf, 'generated an exception:', ex)
+
+    mgr.title('Conversion finished.')
+
+
+class progress_reporter(object):
+    def __init__(self, pc: ProgressBarCounter):
+        self.pc = pc
+
+    def label(self, value):
+        self.pc.label = value
+
+    def report(self, value, total=None, label=None):
+        self.pc.items_completed = value
+        if total is not None:
+            self.pc.total = total
+        if label is not None:
+            self.pc.label = label
+        self.pc.progress_bar.invalidate()
+
+    def advance(self, step=1, label=None):
+        self.pc.items_completed += step
+        if label is not None:
+            self.pc.label = label
+        self.pc.progress_bar.invalidate()
+
+    def finish(self):
+        self.pc.items_completed = self.pc.total
+        self.pc.done = True
+        self.pc.progress_bar.invalidate()
+
+
+class progress_manager(object):
+    def __init__(self, pbm: ProgressBar):
+        self.pbm = pbm
+
+    def title(self, title):
+        self.pbm.title = title
+
+    def add(self, label=None, total=None, remove_when_done=True):
+        pc = ProgressBarCounter(self.pbm, None, label, remove_when_done=remove_when_done, total=total)
+        self.pbm.counters.append(pc)
+        return progress_reporter(pc)
 
 
 def main():
-    with ProgressBar(title='Processing HPX output files') as bar:
-        # Counter line search and counter name parsing regex patterns
-        counter_line_pattern = get_pfx_counter_line_pattern()
-        counter_form_pattern = get_general_counter_form_pattern()
-
-        with step_block('Checking regex patterns integrity', bar, 2) as sb:
-            test_general_counter_form_pattern(counter_form_pattern)
-            sb.report()
-            test_pfx_counter_line_pattern(counter_line_pattern)
-
-        with step_block('Listing *.txt files in current directory', bar, 2) as sb:
-            hpx_output_files = glob.glob('*.txt')
-            sb.report()
-            assert isinstance(hpx_output_files, list)
-            assert len(hpx_output_files) >= 1
-
-        for rf in bar(hpx_output_files, label='Processed file(s)'):
-            # print(80 * '=')
-            # print('subject:', rf)
-            # print(80 * '-')
-
-            r0f = os.path.join(os.curdir, rf)
-            with step_block(r0f + ': Reading', bar):
-                hpx_out = read_file(r0f)
-
-            with step_block(r0f + ': Extracting counters', bar):
-                line_gen = extract_counter_lines(hpx_out, counter_line_pattern)
-
-            with step_block(r0f + ': Processing counters', bar, 2) as sb:
-                col_gen = process_counters(line_gen, counter_form_pattern)
-                sb.report()
-                vals = list(col_gen)
-
-            with step_block(r0f + ': Assembling dataframe', bar):
-                df = pd.DataFrame(vals, columns=[
-                    'objectname', 'locality', 'instance', 'countername',
-                    'thread_id', 'parameters', 'general_form', 'iteration',
-                    'timestamp', 'timestamp_unit', 'value', 'unit'])
-
-            with step_block(r0f + ': Pruning fields', bar):
-                check_and_prune_fields(df)
-
-            with step_block(r0f + ': Extracing values', bar):
-                vdf = process_df(df)
-
-            def get_csv_output_path(original_path):
-                return os.path.splitext(original_path)[0] + '.csv'
-            of = get_csv_output_path(rf)
-
-            with step_block('Writing to ' + of, bar):
-                vdf.to_csv(of, float_format='%g')
+    with ProgressBar(title='Convert HPX output file(s) to CSV') as pbm:
+        mgr = progress_manager(pbm)
+        run(mgr)
 
 
 if __name__ == '__main__':

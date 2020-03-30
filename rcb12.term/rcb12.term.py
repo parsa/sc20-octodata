@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
-import os
-import glob
-import re
-import pandas as pd
 import concurrent.futures
+import glob
+import lzma
+import os
+import pathlib
+import re
 
-from prompt_toolkit.shortcuts import ProgressBar
-from prompt_toolkit.shortcuts.progress_bar.base import ProgressBarCounter
+import pandas as pd
+from tqdm import tqdm
 
 
 def get_pfx_counter_line_pattern():
@@ -88,7 +89,7 @@ def read_file(filepath):
     assert os.access(filepath, os.R_OK)
 
     # Read one file for testing
-    with open(filepath, 'r') as hpx_output_handle:
+    with lzma.open(filepath, 'rt', encoding='utf-8') as hpx_output_handle:
         hpx_output = hpx_output_handle.read()
     return hpx_output
 
@@ -213,123 +214,94 @@ def process_df(df):
 
 def process_file(rf, counter_line_pattern, counter_form_pattern, pc):
     r0f = os.path.join(os.curdir, rf)
-    pc.report(0, 7, 'Reading')
+    pc.set_description('Reading')
     hpx_out = read_file(r0f)
+    pc.update()
 
-    pc.advance(label='Extracting counters')
+    pc.set_description('Extracting counters')
     line_gen = extract_counter_lines(hpx_out, counter_line_pattern)
+    pc.update()
 
-    pc.advance(label='Processing counters')
+    pc.set_description('Processing counters')
     col_gen = process_counters(line_gen, counter_form_pattern)
     vals = list(col_gen)
+    pc.update()
 
-    pc.advance(label='Assembling dataframe')
+    pc.set_description('Assembling dataframe')
     df = pd.DataFrame(vals, columns=[
         'objectname', 'locality', 'instance', 'countername',
         'thread_id', 'parameters', 'general_form', 'iteration',
         'timestamp', 'timestamp_unit', 'value', 'unit'])
+    pc.update()
 
-    pc.advance(label='Pruning fields')
+    pc.set_description('Pruning fields')
     check_and_prune_fields(df)
+    pc.update()
 
-    pc.advance(label='Extracting values')
+    pc.set_description('Extracting values')
     vdf = process_df(df)
+    pc.update()
 
     def get_csv_output_path(original_path):
-        return os.path.splitext(original_path)[0] + '.csv'
+        return str(pathlib.Path(original_path[:-3]).with_suffix('.csv'))
     of = get_csv_output_path(rf)
 
-    pc.advance(label='Exporting to ' + of)
+    pc.set_description('Exporting to ' + of)
     vdf.to_csv(of, float_format='%g')
-    pc.advance(label='Exported ' + of)
-    pc.finish()
+    pc.update()
+
+    pc.set_description('Exported ' + of)
+    pc.update()
+    pc.close()
 
 
-def run(mgr):
-    pc = mgr.add('Counter line search and counter name parsing regex patterns', 2)
-    pc.report(0, 2)
-    counter_line_pattern = get_pfx_counter_line_pattern()
-    pc.report(1, 2)
-    counter_form_pattern = get_general_counter_form_pattern()
-    pc.finish()
+def run():
+    with tqdm(desc='Counter line search and counter name parsing regex patterns',
+              total=2, leave=False) as pc:
+        counter_line_pattern = get_pfx_counter_line_pattern()
+        pc.update()
+        counter_form_pattern = get_general_counter_form_pattern()
+        pc.update()
 
     def check_regex_patterns_integrity():
         test_general_counter_form_pattern(counter_form_pattern)
         test_pfx_counter_line_pattern(counter_line_pattern)
-    pc = mgr.add('Checking regex patterns integrity')
-    check_regex_patterns_integrity()
-    pc.finish()
+    with tqdm(desc='Checking regex patterns integrity', leave=False) as pc:
+        check_regex_patterns_integrity()
 
     def list_txt_files_in_cur_dir():
-        hpx_output_files = glob.glob('*.txt')
+        hpx_output_files = glob.glob('*.txt.xz')
         assert isinstance(hpx_output_files, list)
         assert len(hpx_output_files) >= 1
         return hpx_output_files
-    pc = mgr.add('Listing *.txt files in current directory')
-    hpx_output_files = list_txt_files_in_cur_dir()
-    pc.finish()
+    with tqdm(desc='Listing *.txt.xz files in current directory', leave=False) as pc:
+        hpx_output_files = list_txt_files_in_cur_dir()
 
-    def task_process_file(rf, mgr):
-        pc = mgr.add(rf, remove_when_done=False)
-        process_file(rf, counter_line_pattern, counter_form_pattern, pc)
-        pc.finish()
+    def task_process_file(rf):
+        with tqdm(desc=rf, total=8, leave=True) as pc:
+            process_file(rf, counter_line_pattern, counter_form_pattern, pc)
 
-    with concurrent.futures.ThreadPoolExecutor(4) as executor:
-        conversion_tasks = {executor.submit(task_process_file, rf, mgr): rf for rf in hpx_output_files}
-        for future in concurrent.futures.as_completed(conversion_tasks):
-            rf = conversion_tasks[future]
-            try:
-                future.result()
-            except Exception as ex:
-                print(rf, 'generated an exception:', ex)
+    subject_count = len(hpx_output_files)
+    with tqdm(desc='Convert HPX output file(s) to CSV', total=subject_count,
+              position=0) as pc:
+        with concurrent.futures.ThreadPoolExecutor(4) as executor:
+            conversion_tasks = {
+                executor.submit(task_process_file, rf):
+                    rf for rf in hpx_output_files
+            }
+            for future in concurrent.futures.as_completed(conversion_tasks):
+                rf = conversion_tasks[future]
+                try:
+                    future.result()
+                    pc.update()
+                except Exception as ex:
+                    print(rf, 'generated an exception:', ex)
 
-    mgr.title('Conversion finished.')
-
-
-class progress_reporter(object):
-    def __init__(self, pc: ProgressBarCounter):
-        self.pc = pc
-
-    def label(self, value):
-        self.pc.label = value
-
-    def report(self, value, total=None, label=None):
-        self.pc.items_completed = value
-        if total is not None:
-            self.pc.total = total
-        if label is not None:
-            self.pc.label = label
-        self.pc.progress_bar.invalidate()
-
-    def advance(self, step=1, label=None):
-        self.pc.items_completed += step
-        if label is not None:
-            self.pc.label = label
-        self.pc.progress_bar.invalidate()
-
-    def finish(self):
-        self.pc.items_completed = self.pc.total
-        self.pc.done = True
-        self.pc.progress_bar.invalidate()
-
-
-class progress_manager(object):
-    def __init__(self, pbm: ProgressBar):
-        self.pbm = pbm
-
-    def title(self, title):
-        self.pbm.title = title
-
-    def add(self, label=None, total=None, remove_when_done=True):
-        pc = ProgressBarCounter(self.pbm, None, label, remove_when_done=remove_when_done, total=total)
-        self.pbm.counters.append(pc)
-        return progress_reporter(pc)
+        pc.set_description('Conversion finished.')
 
 
 def main():
-    with ProgressBar(title='Convert HPX output file(s) to CSV') as pbm:
-        mgr = progress_manager(pbm)
-        run(mgr)
+    run()
 
 
 if __name__ == '__main__':

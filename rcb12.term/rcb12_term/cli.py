@@ -5,84 +5,11 @@ import glob
 import lzma
 import os
 import pathlib
-import re
 
 import pandas as pd
 from tqdm import tqdm
 
-
-def get_pfx_counter_line_pattern():
-    return re.compile(
-        r'^/[^{]+\{[^}]+\}/([^,]+,){4,5}[^,\n]+$', re.MULTILINE)
-
-
-def test_pfx_counter_line_pattern(pattern):
-    def test_case(subject):
-        return [i.group() for i in pattern.finditer(subject)]
-
-    subject = '''
-/octotiger{locality#0/total}/subgrid_leaves,2,3602.438779,[s],32428
-/octotiger{locality#1/total}/subgrid_leaves,2,3602.428582,[s],34118
-/octotiger{locality#2/total}/subgrid_leaves,2,3602.430246,[s],33918
-/octotiger{locality#3/total}/subgrid_leaves,2,3602.431576,[s],34443
-/octotiger{locality#4/total}/subgrid_leaves,2,3602.436175,[s],33173
-/threads{locality#59/total/total}/count/cumulative,44,154828.198473,[s],2.3065e+09
-/threads{locality#60/total/total}/count/cumulative,44,154828.221342,[s],2.24724e+09
-/threads{locality#61/total/total}/count/cumulative,44,154828.184221,[s],2.28135e+09
-/threads{locality#62/total/total}/count/cumulative,44,154828.221351,[s],2.20491e+09
-/threads{locality#63/total/total}/count/cumulative,44,154828.216028,[s],2.05324e+09
-/threads{locality#0/pool#default/worker-thread#0}/count/cumulative,44,154828.257432,[s],1.14378e+08
-/threads{locality#0/pool#default/worker-thread#1}/count/cumulative,44,154828.260203,[s],1.05219e+08
-/threads{locality#0/pool#default/worker-thread#2}/count/cumulative,44,154828.262954,[s],1.04616e+08
-/threads{locality#0/pool#default/worker-thread#3}/count/cumulative,44,154828.262962,[s],1.04786e+08
-    '''
-    expected = [
-        '/octotiger{locality#0/total}/subgrid_leaves,2,3602.438779,[s],32428',
-        '/octotiger{locality#1/total}/subgrid_leaves,2,3602.428582,[s],34118',
-        '/octotiger{locality#2/total}/subgrid_leaves,2,3602.430246,[s],33918',
-        '/octotiger{locality#3/total}/subgrid_leaves,2,3602.431576,[s],34443',
-        '/octotiger{locality#4/total}/subgrid_leaves,2,3602.436175,[s],33173',
-        '/threads{locality#59/total/total}/count/cumulative,44,154828.198473,[s],2.3065e+09',
-        '/threads{locality#60/total/total}/count/cumulative,44,154828.221342,[s],2.24724e+09',
-        '/threads{locality#61/total/total}/count/cumulative,44,154828.184221,[s],2.28135e+09',
-        '/threads{locality#62/total/total}/count/cumulative,44,154828.221351,[s],2.20491e+09',
-        '/threads{locality#63/total/total}/count/cumulative,44,154828.216028,[s],2.05324e+09',
-        '/threads{locality#0/pool#default/worker-thread#0}/count/cumulative,44,154828.257432,[s],1.14378e+08',
-        '/threads{locality#0/pool#default/worker-thread#1}/count/cumulative,44,154828.260203,[s],1.05219e+08',
-        '/threads{locality#0/pool#default/worker-thread#2}/count/cumulative,44,154828.262954,[s],1.04616e+08',
-        '/threads{locality#0/pool#default/worker-thread#3}/count/cumulative,44,154828.262962,[s],1.04786e+08'
-    ]
-
-    assert test_case(subject) == expected
-
-
-def get_general_counter_form_pattern():
-    return re.compile(
-        r'/(?P<object>[^{]+)\{locality#(?P<locality>\d+)/(?:(?:(?P<instance1>pool#[^/]+/[^#]+)#(?P<thread_id>\d+))|(?P<instance2>[^}]+))\}/(?P<counter>[^@]+)(?:@(?P<params>.+))?')
-
-
-def test_general_counter_form_pattern(pattern):
-    def test_case(subject):
-        m = pattern.match(subject)
-        assert m is not None
-        return m.groupdict()
-
-    assert test_case('/threads{locality#0/pool#default/worker-thread#0}/count/cumulative') == {
-        'object': 'threads',
-        'locality': '0',
-        'instance1': 'pool#default/worker-thread',
-        'thread_id': '0',
-        'instance2': None,
-        'counter': 'count/cumulative',
-        'params': None}
-    assert test_case('/threads{locality#61/total/total}/count/cumulative,44,154828.184221,[s],2.28135e+09') == {
-        'object': 'threads',
-        'locality': '61',
-        'instance1': None,
-        'thread_id': None,
-        'instance2': 'total/total',
-        'counter': 'count/cumulative,44,154828.184221,[s],2.28135e+09',
-        'params': None}
+from . import patterns
 
 
 def read_file(filepath):
@@ -258,16 +185,10 @@ def process_file(rf, counter_line_pattern, counter_form_pattern, pc):
 def run():
     with tqdm(desc='Counter line search and counter name parsing regex patterns',
               total=2, leave=False) as pc:
-        counter_line_pattern = get_pfx_counter_line_pattern()
+        counter_line_pattern = patterns.get_pfx_counter_line_pattern()
         pc.update()
-        counter_form_pattern = get_general_counter_form_pattern()
+        counter_form_pattern = patterns.get_general_counter_form_pattern()
         pc.update()
-
-    def check_regex_patterns_integrity():
-        test_general_counter_form_pattern(counter_form_pattern)
-        test_pfx_counter_line_pattern(counter_line_pattern)
-    with tqdm(desc='Checking regex patterns integrity', leave=False) as pc:
-        check_regex_patterns_integrity()
 
     def list_txt_files_in_cur_dir():
         hpx_output_files = glob.glob('*.txt.xz')
@@ -302,7 +223,3 @@ def run():
 
 def main():
     run()
-
-
-if __name__ == '__main__':
-    main()

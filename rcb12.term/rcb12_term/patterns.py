@@ -3,10 +3,10 @@ import re
 
 def get_general_counter_form_pattern():
     return re.compile(
-        r'/(?P<object>[^{]+)\{locality#(?P<locality>\d+)'
-        r'/(?:(?:(?P<instance1>pool#[^/]+/[^#]+)'
-        r'#(?P<thread_id>\d+))|(?P<instance2>[^}]+))\}'
-        r'/(?P<counter>[^@]+)(?:@(?P<params>.+))?')
+        r'/(?P<object>[^{\n]+)\{locality#(?P<locality>\d+)'
+        r'/(?:(?:(?P<instance1>pool#[^/\n]+/[^#\n]+)'
+        r'#(?P<thread_id>\d+))|(?P<instance2>[^}\n]+))\}'
+        r'/(?P<counter>[^@\n]+)(?:@(?P<params>.+))?')
 
 
 def get_pfx_counter_line_pattern():

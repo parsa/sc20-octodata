@@ -1,14 +1,26 @@
 import re
 
 
-def get_general_counter_form_pattern():
-    return re.compile(
-        r'/(?P<object>[^{\n]+)\{locality#(?P<locality>\d+)'
-        r'/(?:(?:(?P<instance1>pool#[^/\n]+/[^#\n]+)'
-        r'#(?P<thread_id>\d+))|(?P<instance2>[^}\n]+))\}'
-        r'/(?P<counter>[^@\n]+)(?:@(?P<params>.+))?')
+dec_val_regex = re.compile(
+    r'^(/[^,\n]+)(,[^,\n]+){4,5}$', re.MULTILINE
+)
 
 
-def get_pfx_counter_line_pattern():
-    return re.compile(
-        r'^/[^{]+\{[^}]+\}/([^,]+,){4,5}[^,\n]+$', re.MULTILINE)
+def generator(hpx_out):
+    for i in dec_val_regex.finditer(hpx_out):
+        yield i[0] + '\n'
+
+
+class generator_reader(object):
+    def __init__(self, hpx_out):
+        self.hpx_out = hpx_out
+        self.gen = generator(self.hpx_out)
+
+    def __iter__(self):
+        return self
+
+    def read(self, n=0):
+        try:
+            return next(self.gen)
+        except StopIteration:
+            return ''

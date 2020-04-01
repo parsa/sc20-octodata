@@ -20,10 +20,6 @@ profile_imports:
 tests:
 	-python3 -m unittest discover tests/ -v
 
-.PHONY: checks
-checks:
-	python3 -m checks
-
 .PHONY: clean
 clean:
 	-rm -rf build dist *.egg-info

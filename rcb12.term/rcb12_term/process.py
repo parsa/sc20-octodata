@@ -1,62 +1,11 @@
+import numpy as np
 import pandas as pd
 
-
-def extract_counter_lines(hpx_output, pfx_counter_line_pattern):
-    assert isinstance(hpx_output, str)
-
-    for pfx_counter_line in pfx_counter_line_pattern.finditer(hpx_output):
-        raw_line = pfx_counter_line.group(0)
-
-        line_segments = raw_line.split(',')
-
-        def justify_fields(segments):
-            if len(segments) == 5:
-                # Unit for count values
-                segments += ('1')
-            assert len(segments) == 6
-        justify_fields(line_segments)
-
-        yield line_segments
-
-
-def process_counters(lines, general_counter_form_pattern):
-    for segments in lines:
-        general_form = segments[0]
-        general_form_m = general_counter_form_pattern.match(
-            general_form)
-        assert general_form_m is not None
-
-        value_group_dict = general_form_m.groupdict()
-
-        def unify_instance_field(groups):
-            if groups['instance1'] is not None:
-                groups['instance'] = groups['instance1']
-            else:
-                groups['instance'] = groups['instance2']
-
-            del groups['instance1']
-            del groups['instance2']
-        unify_instance_field(value_group_dict)
-
-        yield (
-            value_group_dict["object"],
-            value_group_dict["locality"],
-            value_group_dict["instance"],
-            value_group_dict["counter"],
-            value_group_dict["thread_id"],
-            value_group_dict["params"],
-        ) + tuple(segments)
+from .helpers import progress_block
+from .patterns import generator_reader
 
 
 def check_and_prune_fields(df):
-    def fix_units(df):
-        df.locality = pd.to_numeric(df.locality, downcast='unsigned')
-        df.iteration = pd.to_numeric(df.iteration, downcast='unsigned')
-        df.timestamp = pd.to_numeric(df.timestamp)
-        df.value = pd.to_numeric(df.value)
-        df.thread_id = pd.to_numeric(df.thread_id, downcast='unsigned')
-        df.loc[df.countername == 'idle-rate', 'value'] *= 0.01
-
     def drop_irrelevant_counters(df):
         def drop_values(column, value):
             df.drop(df.index[df[column] == value], inplace=True)
@@ -68,25 +17,16 @@ def check_and_prune_fields(df):
 
     # Units can only be [0.01%], 1, [s], and [ns]
     def check_all_data_units(df):
-        x = df.loc[(df.unit != '1')]
-        x = x.loc[x.unit != '[0.01%]']
-        x = x.loc[x.unit != '[s]']
-        x = x.loc[x.unit != '[ns]']
-        assert len(x) == 0
+        for i in df.value_unit.unique():
+            assert i in ['[s]', '[ns]', '[0.01%]'] or np.isnan(i)
 
     def remove_unused_columns(df):
-        # No parameters are expected
-        assert len(df.loc[~df.parameters.isnull()]) == 0
-        del df['parameters']
-
         del df['timestamp_unit']
-        del df['unit']
+        del df['value_unit']
         del df['timestamp']
-        del df['general_form']
 
     assert isinstance(df, pd.DataFrame)
 
-    fix_units(df)
     drop_irrelevant_counters(df)
     check_all_data_units(df)
     remove_unused_columns(df)
@@ -95,9 +35,7 @@ def check_and_prune_fields(df):
 def process_df(df):
     def get_octotiger_counters(df):
         octo_pivot = df.pivot_table(
-            index=[
-                'iteration',
-                'locality'],
+            index=['iteration', 'locality'],
             columns=['countername'],
             values='value',
             dropna=False)
@@ -107,9 +45,7 @@ def process_df(df):
 
     def get_idle_rate_counters(df):
         idle_rate_pivot = df.pivot_table(
-            index=[
-                'iteration',
-                'locality'],
+            index=['iteration', 'locality'],
             columns=['thread_id'],
             values='value')
         return idle_rate_pivot
@@ -119,28 +55,58 @@ def process_df(df):
     return result
 
 
-def process_file(hpx_out, counter_line_pattern, counter_form_pattern, pc):
-    pc.set_description('Extracting counters')
-    line_gen = extract_counter_lines(hpx_out, counter_line_pattern)
-    pc.update()
+def process_file(hpx_out, pc):
+    with progress_block('Extracting counters', pc):
+        df = pd.read_csv(
+            generator_reader(hpx_out),
+            names=['full_counter_name', 'iteration', 'timestamp',
+                   'timestamp_unit', 'value', 'value_unit'],
+            dtype={'full_counter_name': 'str', 'iteration': 'uint64',
+                   'timestamp': 'float64', 'timestamp_unit': 'str',
+                   'value': 'float64', 'value_unit': 'str'},
+        )
 
-    pc.set_description('Processing counters')
-    col_gen = process_counters(line_gen, counter_form_pattern)
-    vals = list(col_gen)
-    pc.update()
+    assert 0 != len(df)
 
-    pc.set_description('Assembling dataframe')
-    df = pd.DataFrame(vals, columns=[
-        'objectname', 'locality', 'instance', 'countername',
-        'thread_id', 'parameters', 'general_form', 'iteration',
-        'timestamp', 'timestamp_unit', 'value', 'unit'])
-    pc.update()
+    assert 0 == len(df[df.iteration.isna()])
+    assert 0 == len(df[df.timestamp.isna()])
+    assert 0 == len(df[df.timestamp_unit.isna()])
+    assert 0 == len(df[df.value.isna()])
 
-    pc.set_description('Pruning fields')
-    check_and_prune_fields(df)
-    pc.update()
+    with progress_block('Parsing counter names', pc):
+        df[['objectname', 'locality', 'instancename', 'countername']] = \
+            df.full_counter_name.str.extract(
+                r'/(.+){locality#(\d+)/(.+)}/(.+)', expand=True)
 
-    pc.set_description('Extracting values')
-    vdf = process_df(df)
-    pc.update()
+    assert 0 == len(df[df.objectname.isna()])
+    assert 0 == len(df[df.locality.isna()])
+    assert 0 == len(df[df.instancename.isna()])
+    assert 0 == len(df[df.countername.isna()])
+
+    assert 0 != len(df[df.objectname == 'octotiger'])
+
+    with progress_block('Parsing worker thread ids', pc):
+        df['thread_id'] = df.instancename.str.extract(
+            r'pool#default/worker-thread#(\d+)',
+            expand=True).astype('uint64', errors='ignore')
+
+    df.locality = df.locality.astype('uint64', errors='raise')
+
+    with progress_block('Fixing units', pc):
+        df.iteration = pd.to_numeric(df.iteration, downcast='unsigned')
+        df.timestamp = pd.to_numeric(df.timestamp)
+        df.value = pd.to_numeric(df.value)
+        df.thread_id = pd.to_numeric(df.thread_id, downcast='unsigned')
+
+    with progress_block('Convert nanoseconds to seconds', pc):
+        df.loc[df.value_unit == '[0.01%]', 'value'] *= 0.01
+        df.loc[df.value_unit == '[ns]', 'value'] *= 1.0e-9
+        df.loc[df.value_unit == '[ns]', 'value_unit'] = '[s]'
+
+    with progress_block('Pruning fields', pc):
+        check_and_prune_fields(df)
+
+    with progress_block('Extracting values', pc):
+        vdf = process_df(df)
+
     return vdf

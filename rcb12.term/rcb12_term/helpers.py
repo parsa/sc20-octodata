@@ -1,3 +1,4 @@
+import contextlib
 import glob
 import lzma
 import os
@@ -21,3 +22,12 @@ def list_txt_files_in_cur_dir(pattern):
 
 def get_csv_output_path(original_path):
     return str(pathlib.Path(original_path[:-3]).with_suffix('.csv'))
+
+
+@contextlib.contextmanager
+def progress_block(msg, pc):
+    try:
+        pc.set_description(msg)
+        yield
+    finally:
+        pc.update()
